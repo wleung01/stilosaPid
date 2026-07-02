@@ -20,15 +20,22 @@ Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX_CS);
 // Hardware Pins
 #define SSR_PIN   6   // Digital pin controlling the zero-crossing SSR
 
+// Boost tracking
+#define HISTORY_SIZE (6)
+static float tempHistory[HISTORY_SIZE] = {0};
+static int historyIndex = 0;
+static bool historyFilled = false;
+static unsigned long lastHistoryUpdate = 0;
+
 // --- Custom PID & Controls Setup ---
 float setpoint = 93.0; 
 float input = 0.0;     // Smoothed temperature
 float output = 0.0;    // SSR Window Duty Time (0 to 1000ms)
 
 // PID Tuning Parameters
-float kp = 50.0;
-float ki = 0.8;
-float kd = 250.0;
+float kp = 15.0;
+float ki = 0.12;
+float kd = 380.0;
 
 // Internal PID State Registers
 float integralError = 0.0;
@@ -40,14 +47,12 @@ float alpha = 0.25;
 
 // Boost Mode Logic Variables
 bool isBoosting = false;
-float lastTempForDropCheck = 0.0;
-unsigned long lastDropCheckTime = 0;
 unsigned long boostStartTime = 0;
 
 // Boost Configuration Constants
-const float DROP_THRESHOLD = 0.4;       
-const unsigned long BOOST_MAX_TIME = 40000; 
-const float BOOST_DEACTIVATION_ZONE = 1.5; 
+const float DROP_THRESHOLD = 0.15;       
+const unsigned long BOOST_MAX_TIME = 22000; 
+const float BOOST_DEACTIVATION_ZONE = 3.0; 
 
 // Slow PWM Window Configuration for SSR
 unsigned long windowStartTime;
@@ -96,18 +101,27 @@ void loop() {
   }
 
   // 2. Automated Boost Mode Detection Loop
-  if (now - lastDropCheckTime >= 500) {
-    if (lastTempForDropCheck > 0.0) {
-      float tempDrop = lastTempForDropCheck - input;
-      
-      // If temperature drops rapidly during shot extraction
-      if (tempDrop >= DROP_THRESHOLD && !isBoosting && input > (setpoint - 10.0)) {
-        isBoosting = true;
-        boostStartTime = now;
-      }
+  if (now - lastHistoryUpdate >= 500) {
+    lastHistoryUpdate = now;
+    tempHistory[historyIndex] = input; // input is current temp
+    historyIndex++;
+
+    if (historyIndex >= HISTORY_SIZE) {
+      historyIndex = 0;
+      historyFilled = true; // We now have 3 secs of data
     }
-    lastTempForDropCheck = input;
-    lastDropCheckTime = now;
+  }
+
+  // Check for the 1.0 Deg C drop over the 3 sec window
+  if (historyFilled && !isBoosting) {
+    float tempThreeSecondsAgo = tempHistory[historyIndex];
+    float tempDrop = tempThreeSecondsAgo - input;
+    
+    // If temperature drops rapidly during shot extraction
+    if (tempDrop >= DROP_THRESHOLD && input > (setpoint - 10.0)) {
+      isBoosting = true;
+      boostStartTime = now;
+    }
   }
 
   // 3. Evaluate Boost Exit Conditions
@@ -119,7 +133,7 @@ void loop() {
 
   // 4. Heat Duty Calculation (Custom PID vs. Boost Overdrive)
   if (isBoosting) {
-    output = windowSize; // Force 100% full ON duty cycle (1000ms)
+    output = windowSize * 0.3; // Force 30% full ON duty cycle (1000ms)
   } else {
     // Custom Time-Delta PID Calculation Loop
     float dt = (float)(now - lastPIDTime) / 1000.0f; // Calculate delta time in seconds
@@ -132,12 +146,22 @@ void loop() {
       // Integral term with strict windup clamping
       integralError += error * dt;
       float iTerm = ki * integralError;
-      if (iTerm > 400.0) { iTerm = 400.0; integralError = 400.0 / ki; } // Upper bound clamp
+      if (iTerm > 80.0) { iTerm = 80.0; integralError = 80.0 / ki; } // Upper bound clamp
       if (iTerm < 0.0)   { iTerm = 0.0;   integralError = 0.0; }          // Lower bound clamp (no negative heating)
       
       // Derivative term
       float dTerm = kd * ((error - lastError) / dt);
       
+      // Integral clamp
+      if (iTerm > 150.0) {
+        iTerm = 150.0;
+        integralError = 150.0 / ki;
+      }
+      if (iTerm < 30.0) {
+        iTerm = 30.0; 
+        integralError = 30.0 / ki;
+      }
+
       // Combine terms and constrain to our 0-1000ms window limits
       output = pTerm + iTerm + dTerm;
       if (output > (float)windowSize) output = (float)windowSize;
