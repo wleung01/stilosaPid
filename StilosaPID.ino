@@ -33,9 +33,9 @@ float input = 0.0;     // Smoothed temperature
 float output = 0.0;    // SSR Window Duty Time (0 to 1000ms)
 
 // PID Tuning Parameters
-float kp = 15.0;
-float ki = 0.12;
-float kd = 380.0;
+float kp = 17.0;
+float ki = 1.0;
+float kd = 0.0;
 
 // Internal PID State Registers
 float integralError = 0.0;
@@ -126,14 +126,14 @@ void loop() {
 
   // 3. Evaluate Boost Exit Conditions
   if (isBoosting) {
-    if ((now - boostStartTime >= BOOST_MAX_TIME) || (input >= (setpoint - BOOST_DEACTIVATION_ZONE))) {
+    if ((now - boostStartTime >= BOOST_MAX_TIME) || (input >= (setpoint + BOOST_DEACTIVATION_ZONE))) {
       isBoosting = false;
     }
   }
 
   // 4. Heat Duty Calculation (Custom PID vs. Boost Overdrive)
   if (isBoosting) {
-    output = windowSize * 0.3; // Force 30% full ON duty cycle (1000ms)
+    output = windowSize * 0.3; // Force 80% full ON duty cycle (1000ms)
   } else {
     // Custom Time-Delta PID Calculation Loop
     float dt = (float)(now - lastPIDTime) / 1000.0f; // Calculate delta time in seconds
@@ -143,24 +143,22 @@ void loop() {
       // Proportional term
       float pTerm = kp * error;
       
-      // Integral term with strict windup clamping
-      integralError += error * dt;
+      // Integral term with an Integral Window (Only runs within 3°C of target)
+      if (abs(error) < 3.0) {
+          integralError += error * dt;
+          
+      } else {
+          // Keep integral cleared while heating up to completely eliminate windup
+          integralError = 0.0; 
+      }
       float iTerm = ki * integralError;
-      if (iTerm > 80.0) { iTerm = 80.0; integralError = 80.0 / ki; } // Upper bound clamp
-      if (iTerm < 0.0)   { iTerm = 0.0;   integralError = 0.0; }          // Lower bound clamp (no negative heating)
+          
+      // Safe Clamping: Allow it to drop to 0.0 so overshoot stops!
+      if (iTerm > 30.0) { iTerm = 30.0; integralError = 30.0 / ki; } 
+      if (iTerm < 0.0) { iTerm = 0.0; integralError = 0.0; }
       
       // Derivative term
       float dTerm = kd * ((error - lastError) / dt);
-      
-      // Integral clamp
-      if (iTerm > 150.0) {
-        iTerm = 150.0;
-        integralError = 150.0 / ki;
-      }
-      if (iTerm < 30.0) {
-        iTerm = 30.0; 
-        integralError = 30.0 / ki;
-      }
 
       // Combine terms and constrain to our 0-1000ms window limits
       output = pTerm + iTerm + dTerm;
